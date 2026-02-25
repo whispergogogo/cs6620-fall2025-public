@@ -1,5 +1,5 @@
-# This workflow builds and pushes Docker images to Docker Hub
-name: Docker Build and Push
+# This workflow builds and pushes Docker images to Docker Hub, then deploys to EC2 via SSM
+name: Docker Build, Push, and Deploy
 
 on:
   push:
@@ -40,3 +40,65 @@ jobs:
             build.workflow=${{ github.workflow }}
             build.run_id=${{ github.run_id }}
             build.run_number=${{ github.run_number }}
+
+  deploy:
+    name: Deploy to EC2 via SSM
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Send deploy command to EC2 using SSM
+        id: ssm
+        run: |
+          set -euo pipefail
+
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          REGION="${{ secrets.AWS_REGION }}"
+          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/cs6620-app:latest"
+          CONTAINER_NAME="cs6620-app"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Automated deployment from GitHub Actions via SSM" \
+            --parameters commands="[
+              \"set -e\",
+              \"echo '--- Deploy: pull latest image ---'\",
+              \"docker pull $IMAGE\",
+              \"echo '--- Stop old container (if exists) ---'\",
+              \"docker stop $CONTAINER_NAME || true\",
+              \"echo '--- Remove old container (if exists) ---'\",
+              \"docker rm $CONTAINER_NAME || true\",
+              \"echo '--- Run new container ---'\",
+              \"docker run -d --restart unless-stopped --name $CONTAINER_NAME -p 80:5000 $IMAGE\",
+              \"echo '--- Done. docker ps ---'\",
+              \"docker ps | head -50\"
+            ]" \
+            --query "Command.CommandId" --output text)
+
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "SSM CommandId: $COMMAND_ID"
+
+      - name: Wait for SSM command to complete
+        run: |
+          aws ssm wait command-executed \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+
+      - name: Print SSM output (stdout/stderr)
+        if: always()
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.ssm.outputs.command_id }}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}" \
+            --output json
